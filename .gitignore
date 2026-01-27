@@ -1,0 +1,15 @@
+# 忽略特定的文件夹
+assets/
+dataset/
+diffusion_nft.egg-info/
+logs/
+mmcv/
+mmdetection/
+reward_ckpts/
+
+# 忽略特定的文件
+constraints.txt
+LICENSE
+
+# 忽略特定格式的文件
+*.whl
