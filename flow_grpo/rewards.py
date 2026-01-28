@@ -254,6 +254,11 @@ def unifiedreward_score_sglang(device):
 
 
 def multi_score(device, score_dict):
+    """
+    多奖励评分函数（GDPO版本）
+    返回各个子奖励的原始分数，不进行加权求和
+    加权求和将在训练脚本中进行，每个奖励先独立归一化后再加权
+    """
     score_functions = {
         "ocr": ocr_score,
         "imagereward": imagereward_score,
@@ -265,6 +270,8 @@ def multi_score(device, score_dict):
         "clipscore": clip_score,
         "hpsv2": hpsv2_score,
     }
+    
+    # 初始化所有评分函数
     score_fns = {}
     for score_name, weight in score_dict.items():
         score_fns[score_name] = (
@@ -273,12 +280,15 @@ def multi_score(device, score_dict):
             else score_functions[score_name]()
         )
 
-    # only_strict is only for geneval. During training, only the strict reward is needed, and non-strict rewards don't need to be computed, reducing reward calculation time.
     def _fn(images, prompts, metadata, only_strict=True):
-        total_scores = []
-        score_details = {}
+        """
+        计算所有子奖励的原始分数
+        返回：score_details 字典，包含各个子奖励的原始 Tensor 分数
+        """
+        score_details = {}  # 用于存储原始分数
 
         for score_name, weight in score_dict.items():
+            # 计算原始分数
             if score_name == "geneval":
                 scores, rewards, strict_rewards, group_rewards, group_strict_rewards = score_fns[score_name](
                     images, prompts, metadata, only_strict
@@ -291,15 +301,15 @@ def multi_score(device, score_dict):
                     score_details[f"{key}_accuracy"] = value
             else:
                 scores, rewards = score_fns[score_name](images, prompts, metadata)
+
+            # GDPO：只存储原始分数，不进行加权
+            # 确保 scores 是 tensor 格式
+            if isinstance(scores, list):
+                scores = torch.tensor(scores, device=device) if len(scores) > 0 else torch.tensor([], device=device)
+
             score_details[score_name] = scores
-            weighted_scores = [weight * score for score in scores]
 
-            if not total_scores:
-                total_scores = weighted_scores
-            else:
-                total_scores = [total + weighted for total, weighted in zip(total_scores, weighted_scores)]
-
-        score_details["avg"] = total_scores
+        # GDPO：不计算 avg，让训练脚本对每个奖励独立归一化后再加权求和
         return score_details, {}
 
     return _fn

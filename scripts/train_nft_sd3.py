@@ -437,9 +437,7 @@ def main(_):
             transformer = get_peft_model(transformer, transformer_lora_config)
         transformer.add_adapter("old", transformer_lora_config)
         transformer.set_adapter("default")
-    transformer.to(device)
-    # 移除 device_ids 和 output_device，仅保留 find_unused_parameters
-    transformer_ddp = DDP(transformer, find_unused_parameters=False)
+    transformer_ddp = DDP(transformer, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     transformer_ddp.module.set_adapter("default")
     transformer_trainable_parameters = list(filter(lambda p: p.requires_grad, transformer_ddp.module.parameters()))
     transformer_ddp.module.set_adapter("old")
@@ -504,12 +502,8 @@ def main(_):
     sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.sample.train_batch_size, 1)
     train_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.train.batch_size, 1)
 
-    if config.sample.num_image_per_prompt == 1:
-        config.per_prompt_stat_tracking = False
-    if config.per_prompt_stat_tracking:
-        stat_tracker = PerPromptStatTracker(config.sample.global_std)
-    else:
-        assert False
+    # GDPO: 不再需要 per_prompt_stat_tracking，优势计算改为在 batch 内对每个奖励独立归一化
+    stat_tracker = None  # 保留变量以兼容后续代码
 
     executor = futures.ThreadPoolExecutor(max_workers=8)  # Async reward computation
 
@@ -696,10 +690,17 @@ def main(_):
         }
 
         # Logging images (main process)
+        # GDPO：不再使用 avg，改为显示各个子奖励的分数
         if epoch % 10 == 0 and is_main_process(rank):
             images_to_log = images.cpu()  # from last sampling batch on this rank
             prompts_to_log = prompts  # from last sampling batch on this rank
-            rewards_to_log = collated_samples["rewards"]["avg"][-len(images_to_log) :].cpu()
+            
+            # 获取最后一个 batch 对应的各个子奖励分数
+            num_images_last_batch = len(images_to_log)
+            rewards_summary = {}
+            for reward_key in config.reward_fn.keys():
+                if reward_key in collated_samples["rewards"]:
+                    rewards_summary[reward_key] = collated_samples["rewards"][reward_key][-num_images_last_batch:].cpu()
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 num_to_log = min(15, len(images_to_log))
@@ -709,21 +710,25 @@ def main(_):
                     pil = pil.resize((config.resolution, config.resolution))
                     pil.save(os.path.join(tmpdir, f"{idx}.jpg"))
 
+                def format_reward_caption(idx):
+                    parts = [f"{prompts_to_log[idx]:.100}"]
+                    for rk, rv in rewards_summary.items():
+                        parts.append(f"{rk}: {rv[idx].item():.2f}")
+                    return " | ".join(parts)
+
                 wandb.log(
                     {
                         "images": [
                             wandb.Image(
                                 os.path.join(tmpdir, f"{idx}.jpg"),
-                                caption=f"{prompts_to_log[idx]:.100} | avg: {rewards_to_log[idx]:.2f}",
+                                caption=format_reward_caption(idx),
                             )
                             for idx in range(num_to_log)
                         ],
                     },
                     step=global_step,
                 )
-        collated_samples["rewards"]["avg"] = (
-            collated_samples["rewards"]["avg"].unsqueeze(1).repeat(1, num_train_timesteps)
-        )
+        # GDPO：不再需要 avg 的 repeat 操作，后续将对每个奖励独立归一化
 
         # Gather rewards across processes
         gathered_rewards_dict = {}
@@ -743,35 +748,47 @@ def main(_):
                 step=global_step,
             )
 
-        if config.per_prompt_stat_tracking:
-            prompt_ids_all = gather_tensor_to_all(collated_samples["prompt_ids"], world_size)
-            prompts_all_decoded = pipeline.tokenizer.batch_decode(
-                prompt_ids_all.cpu().numpy(), skip_special_tokens=True
-            )
-            # Stat tracker update expects numpy arrays for rewards
-            advantages = stat_tracker.update(prompts_all_decoded, gathered_rewards_dict["avg"])
-
-            if is_main_process(rank):
-                group_size, trained_prompt_num = stat_tracker.get_stats()
-                zero_std_ratio, reward_std_mean = calculate_zero_std_ratio(prompts_all_decoded, gathered_rewards_dict)
-                wandb.log(
-                    {
-                        "group_size": group_size,
-                        "trained_prompt_num": trained_prompt_num,
-                        "zero_std_ratio": zero_std_ratio,
-                        "reward_std_mean": reward_std_mean,
-                        "mean_reward_100": stat_tracker.get_mean_of_top_rewards(100),
-                        "mean_reward_75": stat_tracker.get_mean_of_top_rewards(75),
-                        "mean_reward_50": stat_tracker.get_mean_of_top_rewards(50),
-                        "mean_reward_25": stat_tracker.get_mean_of_top_rewards(25),
-                        "mean_reward_10": stat_tracker.get_mean_of_top_rewards(10),
-                    },
-                    step=global_step,
-                )
-            stat_tracker.clear()
-        else:
-            avg_rewards_all = gathered_rewards_dict["avg"]
-            advantages = (avg_rewards_all - avg_rewards_all.mean()) / (avg_rewards_all.std() + 1e-4)
+        # GDPO：先对每个奖励独立归一化（在当前 batch 内），再按权重加权求和
+        # 获取 config 中的权重
+        reward_weights = config.reward_fn  # dict: {reward_name: weight}
+        
+        # 初始化加权后的归一化奖励累加器
+        total_samples = None
+        for reward_key, weight in reward_weights.items():
+            if reward_key not in gathered_rewards_dict:
+                # 跳过不存在的奖励（如 geneval 的子键）
+                continue
+            
+            raw_scores = gathered_rewards_dict[reward_key]  # numpy array, shape: (N, ...) 或 (N,)
+            if raw_scores.ndim > 1:
+                raw_scores = raw_scores[:, 0]  # 取第一列（如果有多维）
+            
+            # 独立归一化：(raw - mean) / (std + eps)
+            mean_score = raw_scores.mean()
+            std_score = raw_scores.std() + 1e-6
+            normalized_scores = (raw_scores - mean_score) / std_score
+            
+            # 加权累加
+            weighted_normalized = normalized_scores * weight
+            if total_samples is None:
+                total_samples = weighted_normalized
+            else:
+                total_samples = total_samples + weighted_normalized
+        
+        # 最终的 advantages 就是加权求和后的归一化分数
+        advantages = total_samples
+        
+        if is_main_process(rank):
+            # 日志：记录各个子奖励的均值
+            reward_log_dict = {}
+            for reward_key in reward_weights.keys():
+                if reward_key in gathered_rewards_dict:
+                    raw_scores = gathered_rewards_dict[reward_key]
+                    if raw_scores.ndim > 1:
+                        raw_scores = raw_scores[:, 0]
+                    reward_log_dict[f"gdpo_reward_{reward_key}_mean"] = raw_scores.mean()
+                    reward_log_dict[f"gdpo_reward_{reward_key}_std"] = raw_scores.std()
+            wandb.log(reward_log_dict, step=global_step)
         # Distribute advantages back to processes
         samples_per_gpu = collated_samples["timesteps"].shape[0]
         if advantages.ndim == 1:
