@@ -369,7 +369,8 @@ def main(_):
         config.run_name = unique_id
     else:
         config.run_name += "_" + unique_id
-
+    
+    config.save_dir = os.path.join(config.save_dir, unique_id)
     # --- WandB Init (only on main process) ---
     if is_main_process(rank):
         log_dir = os.path.join(config.logdir, config.run_name)
@@ -800,6 +801,11 @@ def main(_):
             ).to(device)
         else:
             assert False
+        
+        # 将 advantages 扩展到与 timesteps 相同的列数，以便在训练循环中按时间步索引
+        # 原来的 shape: [samples_per_gpu, 1] -> 目标 shape: [samples_per_gpu, num_timesteps]
+        num_timesteps = collated_samples["timesteps"].shape[1]
+        collated_samples["advantages"] = collated_samples["advantages"].repeat(1, num_timesteps)
 
         if is_main_process(rank):
             logger.info(f"Advantages mean: {collated_samples['advantages'].abs().mean().item()}")
@@ -829,7 +835,7 @@ def main(_):
             perms_time = torch.stack(
                 [torch.randperm(num_timesteps_filtered, device=device) for _ in range(total_batch_size_filtered)]
             )
-            for key in ["timesteps", "next_timesteps"]:
+            for key in ["timesteps", "next_timesteps", "advantages"]:
                 shuffled_filtered_samples[key] = shuffled_filtered_samples[key][
                     torch.arange(total_batch_size_filtered, device=device)[:, None], perms_time
                 ]
@@ -950,10 +956,42 @@ def main(_):
                     loss_terms["x0_norm_max"] = torch.max(x0**2).detach()
                     loss_terms["old_deviate"] = torch.mean((forward_prediction - old_prediction) ** 2).detach()
                     loss_terms["old_deviate_max"] = torch.max((forward_prediction - old_prediction) ** 2).detach()
-                    positive_prediction = config.beta * forward_prediction + (1 - config.beta) * old_prediction.detach()
+                    
+                    # ========== 自适应 Beta 机制 ==========
+                    # 1. 基于时间的调度 (beta_t)
+                    # t 较大（噪声大）时使用较大的 beta（弱引导）以保持结构
+                    # t 较小时使用较小的 beta（强引导）
+                    beta_min = 0.5 * config.beta
+                    beta_max = 2.0 * config.beta
+                    # t 的形状为 [B]，值在 [0, 1] 范围内
+                    beta_t = beta_min + (beta_max - beta_min) * t  # 形状: [B]
+                    
+                    # 2. 基于不确定性的惩罚
+                    # 如果当前策略与旧策略的偏差过大，增大 beta 进行抑制
+                    gamma = 10.0
+                    # 计算两个预测值的均方差（保留 Batch 维度）
+                    deviation = ((forward_prediction - old_prediction) ** 2).mean(
+                        dim=tuple(range(1, forward_prediction.ndim))
+                    )  # 形状: [B]
+                    beta_adaptive = beta_t * (1 + gamma * deviation)  # 形状: [B]
+                    
+                    # 3. 数值稳定性保护
+                    beta_adaptive = torch.clamp(beta_adaptive, min=1e-4, max=10.0)
+                    
+                    # 扩展维度以便广播: [B] -> [B, 1, 1, 1]
+                    beta_adaptive_expanded = beta_adaptive.view(-1, *([1] * (len(forward_prediction.shape) - 1)))
+                    
+                    # 记录 beta_adaptive 的统计信息
+                    loss_terms["beta_adaptive_mean"] = beta_adaptive.mean().detach()
+                    loss_terms["beta_adaptive_std"] = beta_adaptive.std().detach()
+                    loss_terms["deviation_mean"] = deviation.mean().detach()
+                    # ========== 自适应 Beta 机制结束 ==========
+                    
+                    # 使用自适应 beta 计算正负预测
+                    positive_prediction = beta_adaptive_expanded * forward_prediction + (1 - beta_adaptive_expanded) * old_prediction.detach()
                     implicit_negative_prediction = (
-                        1.0 + config.beta
-                    ) * old_prediction.detach() - config.beta * forward_prediction
+                        1.0 + beta_adaptive_expanded
+                    ) * old_prediction.detach() - beta_adaptive_expanded * forward_prediction
 
                     # adaptive weighting
                     x0_prediction = xt - t_expanded * positive_prediction
@@ -975,7 +1013,8 @@ def main(_):
                         dim=tuple(range(1, x0.ndim))
                     )
 
-                    ori_policy_loss = r * positive_loss / config.beta + (1.0 - r) * negative_loss / config.beta
+                    # 使用 beta_adaptive 作为分母进行加权
+                    ori_policy_loss = r * positive_loss / beta_adaptive + (1.0 - r) * negative_loss / beta_adaptive
                     policy_loss = (ori_policy_loss * config.train.adv_clip_max).mean()
 
                     loss = policy_loss

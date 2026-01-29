@@ -66,7 +66,7 @@ def _get_config(base_model="sd3", n_gpus=1, gradient_step_per_epoch=1, dataset="
         config.pretrained.model = "stabilityai/stable-diffusion-3.5-medium"
         
         # 训练时使用较少的步数以加速采样
-        config.sample.num_steps = 10
+        config.sample.num_steps = 20
         
         # 评估时使用更多步数以获得更好的质量
         config.sample.eval_num_steps = 40
@@ -74,7 +74,7 @@ def _get_config(base_model="sd3", n_gpus=1, gradient_step_per_epoch=1, dataset="
         # 无分类器引导强度
         config.sample.guidance_scale = 4.5
         
-        # 图像分辨率（512x512）
+        # 训练图像分辨率，默认是512
         config.resolution = 512
         
         # KL 散度正则化系数
@@ -145,7 +145,7 @@ def _get_config(base_model="sd3", n_gpus=1, gradient_step_per_epoch=1, dataset="
     # 2: 延迟更新 (flat=75, uprate=0.0075, uphold=0.999)
     config.decay_type = 1
     
-    # beta 参数: 控制正负样本预测的混合比例
+    #! beta 参数: 控制正负样本预测的混合比例
     # positive_prediction = beta * forward + (1-beta) * old
     # implicit_negative = (1+beta) * old - beta * forward
     config.beta = 1.0
@@ -292,10 +292,10 @@ def sd3_multi_reward():
         name="multi_reward",
     )
     
-    # 多奖励时使用更多采样步数以确保质量
+    #! 多奖励时使用更多采样步数以确保质量
     config.sample.num_steps = 25
     
-    # 使用较小的 beta 值以平衡多个奖励
-    config.beta = 0.1
+    #! 使用较小的 beta 值以平衡多个奖励，越小信号强度越高
+    config.beta = 0.25
     
     return config
