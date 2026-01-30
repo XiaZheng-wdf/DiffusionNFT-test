@@ -270,24 +270,26 @@ def sd3_multi_reward():
     使用 GDPO（分组解耦策略优化）同时优化多个奖励目标。
     每个奖励会先在 batch 内独立归一化，然后按权重加权求和。
     
-    当前配置使用三个奖励：
+    当前配置使用四个奖励：
     - pickscore: 人类偏好评分
     - hpsv2: 另一个人类偏好评分  
     - clipscore: CLIP 文本-图像对齐分数
+    - ocr: OCR 文字渲染准确度
     
-    权重都设为 1.0，意味着三个奖励同等重要。
+    权重都设为 1.0，意味着四个奖励同等重要。
     可以调整权重来侧重某些目标。
     """
     reward_fn = {
         "pickscore": 1.0,   # PickScore 权重
         "hpsv2": 1.0,       # HPSv2 权重
         "clipscore": 1.0,   # CLIP Score 权重
+        "ocr": 1.0,         # OCR 文字渲染奖励权重
     }
     config = _get_config(
         base_model="sd3",
         n_gpus=1,
         gradient_step_per_epoch=1,
-        dataset="pickscore",
+        dataset="ocr",  # 使用 OCR 数据集
         reward_fn=reward_fn,
         name="multi_reward",
     )
@@ -296,6 +298,6 @@ def sd3_multi_reward():
     config.sample.num_steps = 25
     
     #! 使用较小的 beta 值以平衡多个奖励，越小信号强度越高
-    config.beta = 0.25
+    config.beta = 0.1
     
     return config

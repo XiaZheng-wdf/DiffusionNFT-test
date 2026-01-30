@@ -38,9 +38,10 @@ def load_geneval(DEVICE):
 
     @timed
     def load_models():
+        # 使用项目内的 mmdetection 配置文件
         CONFIG_PATH = os.path.join(
-            os.path.dirname(os.path.dirname(mmdet.__file__)),
-            "configs/mask2former/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.py",
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "mmdetection/configs/mask2former/mask2former_swin-s-p4-w7-224_8xb2-lsj-50e_coco.py",
         )
         OBJECT_DETECTOR = "mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco_20220504_001756-743b7d99"
         from flow_grpo.reward_ckpt_path import CKPT_PATH
@@ -286,13 +287,39 @@ def load_geneval(DEVICE):
         results = inference_detector(object_detector, [np.array(image_pil) for image_pil in image_pils])
         ret = []
         for result, image_pil, metadata in zip(results, image_pils, metadatas):
-            bbox = result[0] if isinstance(result, tuple) else result
-            segm = result[1] if isinstance(result, tuple) and len(result) > 1 else None
+            # 兼容 mmdetection 3.x 的 DetDataSample 返回格式
+            if hasattr(result, 'pred_instances'):
+                # mmdetection 3.x: 从 DetDataSample 中提取预测结果
+                pred_instances = result.pred_instances
+                bboxes = pred_instances.bboxes.cpu().numpy()  # (N, 4)
+                scores = pred_instances.scores.cpu().numpy()  # (N,)
+                labels = pred_instances.labels.cpu().numpy()  # (N,)
+                masks = pred_instances.masks.cpu().numpy() if hasattr(pred_instances, 'masks') and pred_instances.masks is not None else None
+                
+                # 将结果按类别组织成旧版格式: bbox[class_idx] = (M, 5)，包含 [x1,y1,x2,y2,score]
+                num_classes = len(classnames)
+                bbox = [np.zeros((0, 5), dtype=np.float32) for _ in range(num_classes)]
+                segm = [[] for _ in range(num_classes)] if masks is not None else None
+                
+                for i, (box, score, label) in enumerate(zip(bboxes, scores, labels)):
+                    label = int(label)
+                    if label < num_classes:
+                        box_with_score = np.concatenate([box, [score]])
+                        bbox[label] = np.vstack([bbox[label], box_with_score]) if bbox[label].size else box_with_score.reshape(1, -1)
+                        if masks is not None:
+                            segm[label].append(masks[i])
+            else:
+                # mmdetection 2.x: 旧版格式 (bbox, segm) 元组
+                bbox = result[0] if isinstance(result, tuple) else result
+                segm = result[1] if isinstance(result, tuple) and len(result) > 1 else None
+            
             image = ImageOps.exif_transpose(image_pil)
             detected = {}
             # Determine bounding boxes to keep
             confidence_threshold = THRESHOLD if metadata["tag"] != "counting" else COUNTING_THRESHOLD
             for index, classname in enumerate(classnames):
+                if bbox[index].size == 0:
+                    continue
                 ordering = np.argsort(bbox[index][:, 4])[::-1]
                 ordering = ordering[bbox[index][ordering, 4] > confidence_threshold]  # Threshold
                 ordering = ordering[:MAX_OBJECTS].tolist()  # Limit number of detected objects per class
@@ -302,7 +329,7 @@ def load_geneval(DEVICE):
                     detected[classname].append(
                         (
                             bbox[index][max_obj],
-                            None if segm is None else segm[index][max_obj],
+                            None if segm is None else (segm[index][max_obj] if len(segm[index]) > max_obj else None),
                         )
                     )
                     ordering = [

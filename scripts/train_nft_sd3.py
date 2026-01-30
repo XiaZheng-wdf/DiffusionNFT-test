@@ -580,7 +580,10 @@ def main(_):
         if hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
 
-        # SAMPLING
+        # ================================================================================
+        # Step 1: 数据收集 (Data Collection / Sampling)
+        # 使用旧策略 π_old 对每个提示词生成 K 张图像 {x_0^1, ..., x_0^K}
+        # ================================================================================
         pipeline.transformer.eval()
         samples_data_list = []
 
@@ -594,6 +597,7 @@ def main(_):
             if hasattr(train_sampler, "set_epoch") and isinstance(train_sampler, DistributedKRepeatSampler):
                 train_sampler.set_epoch(epoch * config.sample.num_batches_per_epoch + i)
 
+            # 从数据集采样一批提示词 c ~ C
             prompts, prompt_metadata = next(train_iter)
 
             prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
@@ -634,6 +638,7 @@ def main(_):
                     scaler,
                 )
 
+            # 使用旧策略 π_old ("old" adapter) 生成图像
             transformer_ddp.module.set_adapter("old")
             with torch_autocast(enabled=enable_amp, dtype=mixed_precision_dtype):
                 with torch.no_grad():
@@ -658,6 +663,8 @@ def main(_):
             latents = torch.stack(latents, dim=1)
             timesteps = pipeline.scheduler.timesteps.repeat(len(prompts), 1).to(device)
 
+            #! Step 2: 多维奖励计算 - 对每张图像计算所有奖励函数的原始分数
+            #s_{k,m} = R_m(x_0^k, c), ∀m ∈ {1...M}
             rewards_future = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=True)
             time.sleep(0)
 
@@ -669,10 +676,11 @@ def main(_):
                     "timesteps": timesteps,
                     "next_timesteps": torch.concatenate([timesteps[:, 1:], torch.zeros_like(timesteps[:, :1])], dim=1),
                     "latents_clean": latents[:, -1],
-                    "rewards_future": rewards_future,  # Store future
+                    "rewards_future": rewards_future,
                 }
             )
 
+        # 收集奖励结果 - 保留字典形式 {'aesthetic': [...], 'ocr': [...]}
         for sample_item in tqdm(
             samples_data_list, desc="Waiting for rewards", disable=not is_main_process(rank), position=0
         ):
@@ -691,12 +699,10 @@ def main(_):
         }
 
         # Logging images (main process)
-        # GDPO：不再使用 avg，改为显示各个子奖励的分数
         if epoch % 10 == 0 and is_main_process(rank):
-            images_to_log = images.cpu()  # from last sampling batch on this rank
-            prompts_to_log = prompts  # from last sampling batch on this rank
+            images_to_log = images.cpu()
+            prompts_to_log = prompts
             
-            # 获取最后一个 batch 对应的各个子奖励分数
             num_images_last_batch = len(images_to_log)
             rewards_summary = {}
             for reward_key in config.reward_fn.keys():
@@ -729,8 +735,6 @@ def main(_):
                     },
                     step=global_step,
                 )
-        # GDPO：不再需要 avg 的 repeat 操作，后续将对每个奖励独立归一化
-
         # Gather rewards across processes
         gathered_rewards_dict = {}
         for key, value_tensor in collated_samples["rewards"].items():
@@ -749,38 +753,56 @@ def main(_):
                 step=global_step,
             )
 
-        # GDPO：先对每个奖励独立归一化（在当前 batch 内），再按权重加权求和
-        # 获取 config 中的权重
+        # ================================================================================
+        #! Step 3: 解耦归一化优势计算 (GDPO Advantage Calculation) [核心算法]
+        # ================================================================================
+        # 初始化总优势向量 A_total = 0
+        # 遍历每一个奖励分项 m ∈ {1...M}:
+        #   a. 组内统计: μ_m = Mean({s_1,m, ..., s_K,m}), σ_m = Std({s_1,m, ..., s_K,m})
+        #   b. 独立归一化: ŝ_{k,m} = (s_{k,m} - μ_m) / (σ_m + ε)
+        #   c. 加权累加: A_k ← A_k + w_m · ŝ_{k,m}
+        # ================================================================================
+        
         reward_weights = config.reward_fn  # dict: {reward_name: weight}
         
-        # 初始化加权后的归一化奖励累加器
-        total_samples = None
+        total_samples = None  # A_total = 0
         for reward_key, weight in reward_weights.items():
             if reward_key not in gathered_rewards_dict:
-                # 跳过不存在的奖励（如 geneval 的子键）
                 continue
             
-            raw_scores = gathered_rewards_dict[reward_key]  # numpy array, shape: (N, ...) 或 (N,)
+            raw_scores = gathered_rewards_dict[reward_key]  # s_{k,m}
             if raw_scores.ndim > 1:
-                raw_scores = raw_scores[:, 0]  # 取第一列（如果有多维）
+                raw_scores = raw_scores[:, 0]
             
-            # 独立归一化：(raw - mean) / (std + eps)
-            mean_score = raw_scores.mean()
-            std_score = raw_scores.std() + 1e-6
-            normalized_scores = (raw_scores - mean_score) / std_score
+            # 独立归一化: ŝ_{k,m} = (s_{k,m} - μ_m) / (σ_m + ε)
+            mean_score = raw_scores.mean()  # μ_m
+            std_score = raw_scores.std() + 1e-6  # σ_m + ε
+            normalized_scores = (raw_scores - mean_score) / std_score  # ŝ_{k,m}
             
-            # 加权累加
+            # 加权累加: A_k ← A_k + w_m · ŝ_{k,m}
             weighted_normalized = normalized_scores * weight
             if total_samples is None:
                 total_samples = weighted_normalized
             else:
                 total_samples = total_samples + weighted_normalized
         
-        # 最终的 advantages 就是加权求和后的归一化分数
-        advantages = total_samples
+        # ================================================================================
+        # Step 3.1: Batch-wise Normalization (GDPO 第二阶段归一化)
+        # ================================================================================
+        # 在多个奖励加权求和后，对整个 Batch 的 Total Advantage 再次进行归一化
+        # 目的: 确保 A_total 近似服从标准正态分布 N(0,1)，防止数值范围膨胀导致梯度爆炸
+        # 公式: A_k = (A_k - μ_total) / (σ_total + ε)
+        # ================================================================================
+        adv_mean = total_samples.mean()
+        adv_std = total_samples.std()
+        
+        # 防除零保护: 如果标准差过小（所有样本优势几乎相同），只进行中心化处理
+        if adv_std > 1e-8:
+            advantages = (total_samples - adv_mean) / (adv_std + 1e-8)  # 标准化
+        else:
+            advantages = total_samples - adv_mean  # 只减均值（边界情况）
         
         if is_main_process(rank):
-            # 日志：记录各个子奖励的均值
             reward_log_dict = {}
             for reward_key in reward_weights.keys():
                 if reward_key in gathered_rewards_dict:
@@ -819,8 +841,10 @@ def main(_):
 
         total_batch_size_filtered, num_timesteps_filtered = filtered_samples["timesteps"].shape
 
-        # TRAINING
-        transformer_ddp.train()  # Sets DDP model and its submodules to train mode.
+        # ================================================================================
+        # Step 5: 前向流匹配更新 (Forward Flow Matching Update)
+        # ================================================================================
+        transformer_ddp.train()
 
         # Total number of backward passes before an optimizer step
         effective_grad_accum_steps = config.train.gradient_accumulation_steps * num_train_timesteps
@@ -875,7 +899,7 @@ def main(_):
                     embeds = train_sample_batch["prompt_embeds"]
                     pooled_embeds = train_sample_batch["pooled_prompt_embeds"]
 
-                # Loop over timesteps for this micro-batch
+                # 时间步循环：对每个 t 计算 Flow Matching 损失
                 for j_idx, j_timestep_orig_idx in tqdm(
                     enumerate(range(num_train_timesteps)),
                     desc="Timestep",
@@ -885,19 +909,17 @@ def main(_):
                 ):
                     assert j_idx == j_timestep_orig_idx
                     x0 = train_sample_batch["latents_clean"]
-
                     t = train_sample_batch["timesteps"][:, j_idx] / 1000.0
-
                     t_expanded = t.view(-1, *([1] * (len(x0.shape) - 1)))
-
                     noise = torch.randn_like(x0.float())
 
+                    # Flow Matching 插值: x_t = (1 - t) * x_0 + t * noise
                     xt = (1 - t_expanded) * x0 + t_expanded * noise
 
                     with torch_autocast(enabled=enable_amp, dtype=mixed_precision_dtype):
+                        # v_old: 旧策略预测
                         transformer_ddp.module.set_adapter("old")
                         with torch.no_grad():
-                            # prediction v
                             old_prediction = transformer_ddp(
                                 hidden_states=xt,
                                 timestep=train_sample_batch["timesteps"][:, j_idx],
@@ -907,7 +929,7 @@ def main(_):
                             )[0].detach()
                         transformer_ddp.module.set_adapter("default")
 
-                        # prediction v
+                        # v_θ: 当前策略预测（需要梯度）
                         forward_prediction = transformer_ddp(
                             hidden_states=xt,
                             timestep=train_sample_batch["timesteps"][:, j_idx],
@@ -916,8 +938,8 @@ def main(_):
                             return_dict=False,
                         )[0]
 
-                        with torch.no_grad():  # Reference model part
-                            # For LoRA, disable adapter.
+                        # v_ref: 参考模型预测（用于 KL 正则化）
+                        with torch.no_grad():
                             if config.use_lora:
                                 with transformer_ddp.module.disable_adapter():
                                     ref_forward_prediction = transformer_ddp(
@@ -928,10 +950,14 @@ def main(_):
                                         return_dict=False,
                                     )[0]
                                 transformer_ddp.module.set_adapter("default")
-                            else:  # Full model - this requires a frozen copy of the model
+                            else:
                                 assert False
                     loss_terms = {}
-                    # Policy Gradient Loss
+                    
+                    # ================================================================================
+                    # Step 4: 优势映射 (Probability Mapping)
+                    # r_k = 0.5 + 0.5 * clip(A_k / clip_max, -1, 1)
+                    # ================================================================================
                     advantages_clip = torch.clamp(
                         train_sample_batch["advantages"][:, j_idx],
                         -config.train.adv_clip_max,
@@ -949,51 +975,42 @@ def main(_):
                         elif config.train.adv_mode == "binary":
                             advantages_clip = torch.sign(advantages_clip)
 
-                    # normalize advantage
+                    # r_k = 0.5 + 0.5 * clip(A_k / clip_max, -1, 1)
                     normalized_advantages_clip = (advantages_clip / config.train.adv_clip_max) / 2.0 + 0.5
                     r = torch.clamp(normalized_advantages_clip, 0, 1)
+                    
                     loss_terms["x0_norm"] = torch.mean(x0**2).detach()
                     loss_terms["x0_norm_max"] = torch.max(x0**2).detach()
                     loss_terms["old_deviate"] = torch.mean((forward_prediction - old_prediction) ** 2).detach()
                     loss_terms["old_deviate_max"] = torch.max((forward_prediction - old_prediction) ** 2).detach()
                     
-                    # ========== 自适应 Beta 机制 ==========
-                    # 1. 基于时间的调度 (beta_t)
-                    # t 较大（噪声大）时使用较大的 beta（弱引导）以保持结构
-                    # t 较小时使用较小的 beta（强引导）
+                    # 自适应 Beta 调度
                     beta_min = 0.5 * config.beta
                     beta_max = 2.0 * config.beta
-                    # t 的形状为 [B]，值在 [0, 1] 范围内
-                    beta_t = beta_min + (beta_max - beta_min) * t  # 形状: [B]
-                    
-                    # 2. 基于不确定性的惩罚
-                    # 如果当前策略与旧策略的偏差过大，增大 beta 进行抑制
+                    beta_t = beta_min + (beta_max - beta_min) * t
                     gamma = 10.0
-                    # 计算两个预测值的均方差（保留 Batch 维度）
                     deviation = ((forward_prediction - old_prediction) ** 2).mean(
                         dim=tuple(range(1, forward_prediction.ndim))
-                    )  # 形状: [B]
-                    beta_adaptive = beta_t * (1 + gamma * deviation)  # 形状: [B]
-                    
-                    # 3. 数值稳定性保护
+                    )
+                    beta_adaptive = beta_t * (1 + gamma * deviation)
                     beta_adaptive = torch.clamp(beta_adaptive, min=1e-4, max=10.0)
-                    
-                    # 扩展维度以便广播: [B] -> [B, 1, 1, 1]
                     beta_adaptive_expanded = beta_adaptive.view(-1, *([1] * (len(forward_prediction.shape) - 1)))
                     
-                    # 记录 beta_adaptive 的统计信息
                     loss_terms["beta_adaptive_mean"] = beta_adaptive.mean().detach()
                     loss_terms["beta_adaptive_std"] = beta_adaptive.std().detach()
                     loss_terms["deviation_mean"] = deviation.mean().detach()
-                    # ========== 自适应 Beta 机制结束 ==========
                     
-                    # 使用自适应 beta 计算正负预测
+                    # ================================================================================
+                    # 构建隐式正向目标 v^+ 和负向目标 v^-
+                    # v^+ = (1-β)v_old + β v_θ
+                    # v^- = (1+β)v_old - β v_θ
+                    # ================================================================================
                     positive_prediction = beta_adaptive_expanded * forward_prediction + (1 - beta_adaptive_expanded) * old_prediction.detach()
                     implicit_negative_prediction = (
                         1.0 + beta_adaptive_expanded
                     ) * old_prediction.detach() - beta_adaptive_expanded * forward_prediction
 
-                    # adaptive weighting
+                    # x0 重建损失
                     x0_prediction = xt - t_expanded * positive_prediction
                     with torch.no_grad():
                         weight_factor = (
@@ -1002,6 +1019,7 @@ def main(_):
                             .clip(min=0.00001)
                         )
                     positive_loss = ((x0_prediction - x0) ** 2 / weight_factor).mean(dim=tuple(range(1, x0.ndim)))
+                    
                     negative_x0_prediction = xt - t_expanded * implicit_negative_prediction
                     with torch.no_grad():
                         negative_weight_factor = (
@@ -1013,7 +1031,7 @@ def main(_):
                         dim=tuple(range(1, x0.ndim))
                     )
 
-                    # 使用 beta_adaptive 作为分母进行加权
+                    # 加权损失: L = (1/K) ∑ [r_k * ||v_θ - v^+||^2 + (1-r_k) * ||v_θ - v^-||^2]
                     ori_policy_loss = r * positive_loss / beta_adaptive + (1.0 - r) * negative_loss / beta_adaptive
                     policy_loss = (ori_policy_loss * config.train.adv_clip_max).mean()
 
@@ -1021,10 +1039,10 @@ def main(_):
                     loss_terms["policy_loss"] = policy_loss.detach()
                     loss_terms["unweighted_policy_loss"] = ori_policy_loss.mean().detach()
 
+                    # KL 正则化
                     kl_div_loss = ((forward_prediction - ref_forward_prediction) ** 2).mean(
                         dim=tuple(range(1, x0.ndim))
                     )
-
                     loss += config.train.beta * torch.mean(kl_div_loss)
                     kl_div_loss = torch.mean(kl_div_loss)
                     loss_terms["kl_div_loss"] = torch.mean(kl_div_loss).detach()
@@ -1089,8 +1107,12 @@ def main(_):
         if world_size > 1:
             dist.barrier()
 
+        # ================================================================================
+        # Step 6: 在线更新 (Online Update)
+        # π_old ← τ * π_old + (1-τ) * π_θ
+        # ================================================================================
         with torch.no_grad():
-            decay = return_decay(global_step, config.decay_type)
+            decay = return_decay(global_step, config.decay_type)  # τ
             for src_param, tgt_param in zip(
                 transformer_trainable_parameters, old_transformer_trainable_parameters, strict=True
             ):
